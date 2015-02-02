@@ -1,0 +1,299 @@
+#!/usr/bin/env php
+<?php
+/**
+ * Copyright (c) 2015, Evgeniy Makhrov
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice, this
+ *   list of conditions and the following disclaimer.
+ *
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ * @author Evgeniy Makhrov <emakhrov@gmail.com>
+ */
+
+$db = array(
+    'mosh-server-freebsd-amd64' => array(
+        'ec9be7c7395de01252b376e628f94c16',
+        '0e79dcff7413f6fd084c9ed86373f174',
+    ),
+    /*
+    'mosh-server-darwin-x86_64' => array(
+    ),
+    */
+);
+
+function getopt2($short, $long = array ()) {
+    $o = getopt($short, $long);
+    $is_next_opt_arg = false;
+    $no = array();
+    for ($i = 1; $i < count($_SERVER['argv']); $i++) {
+        $opt = $_SERVER['argv'][$i];
+        $found = false;
+        foreach ($o as $k => $v) {
+            if (substr($opt, 0, strlen($test = "-$k")) == $test) {
+                if ($opt == $test && $v !== false) $is_next_opt_arg = true;
+                $found = true;
+                break;
+            } else if (substr($opt, 0, strlen($test = "--$k")) == $test) {
+                if ($opt == $test && $v !== false) $is_next_opt_arg = true;
+                $found = true;
+                break;
+            }
+        }
+        if (!$found) {
+            if ($is_next_opt_arg) $is_next_opt_arg = false;
+            else $no[] = $opt;
+        }
+    }
+    return array($o, $no);
+}
+if (!function_exists('mb_orig_substr')) {
+    function mb_orig_substr($str, $o, $l = null) {
+        return $l === null ? substr($str, $o) : substr($str, $o, $l);
+    }
+}
+
+$funcs = <<<'EOT'
+function debug($msg) {
+    if (isset($_SERVER['DEBUG']) || in_array('--debug', $_SERVER['argv'])) echo "$msg\n";
+}
+if (!function_exists('mb_orig_strlen')) {
+    function mb_orig_strlen($str) {
+        return strlen($str);
+    }
+}
+function searchPath($filename) {
+    $places = array('.', $_SERVER['HOME'], $_SERVER['HOME'] . '/bin', '/usr/local/bin', '/usr/bin');
+    if (isset($_SERVER['PATH'])) $places = array_merge($places, explode(':', $_SERVER['PATH']));
+    $result = '';
+    foreach ($places as $place) {
+        if (is_file($place . '/' . $filename)) {
+            $result = $place . '/' . $filename;
+            break;
+        }
+    }
+    return $result;
+}
+function directSystem($cmd) {
+    $proc = proc_open($cmd, array(0 => STDIN, 1 => STDOUT, 2 => STDERR), $pipes);
+    if (!$proc) return 255;
+    else return proc_close($proc);
+}
+EOT;
+eval($funcs);
+
+list ($o, $no) = getopt2('an', array('predict:'));
+if (!isset($no[0])) {
+    echo "usage: " . $_SERVER['argv'][0] . " [-a|-n|--predict always|never|adaptive|experimental] <server>\n";
+    exit(1);
+}
+
+if ($no[0] == '@:fakeproxy') {
+    fwrite(STDERR, "PROXY " . gethostbyname($no[1]) . "\n");
+    $fh = fsockopen($no[1], $no[2], $errno, $errstr);
+    if (!$fh) {
+        fwrite(STDERR, "fsockopen $errno: $errstr failed\n");
+        exit(1);
+    }
+    $out = $in = '';
+    /* darwin stdin blocks while select said that it's ok to read */
+    stream_set_blocking(STDIN, 0);
+    while (true) {
+        $r = [STDIN, $fh];
+        $w = $e = [];
+        if (mb_orig_strlen($in)) $w[] = STDOUT;
+        if (mb_orig_strlen($out)) $w[] = $fh;
+        if (stream_select($r, $w, $e, null) === false) {
+            fwrite(STDERR, "select failed\n");
+            exit(1);
+        }
+        foreach ($r as $stream) {
+            $buf = fread($stream, 4096);
+            if ($buf === false || $buf === '') break 2;
+            if ($stream === $fh) $in .= $buf;
+            else $out .= $buf;
+        }
+        foreach ($w as $stream) {
+            if ($stream === $fh) $buf = &$out;
+            else $buf = &$in;
+            $wrote = fwrite($stream, $buf);
+            if ($wrote === false || $wrote === 0) break 2;
+            $buf = mb_orig_substr($buf, $wrote);
+            unset($buf);
+        }
+    }
+    exit(0);
+}
+
+$server = $no[0];
+$predict = 'adaptive';
+if (isset($o['a'])) $predict = 'always';
+if (isset($o['n'])) $predict = 'never';
+if (isset($o['predict'])) $predict = $o['predict'];
+$server_name = strpos($server, '@') !== false ? substr($server, strpos($server, '@') + 1) : $server;
+
+/* this worked for a while but using fakeproxy is more vanila mosh */
+// $addr = gethostbyname($server_name);
+
+$wbuf = $rbuf = '';
+$port = $key = null;
+$code = <<<'EOF'
+function freadAll($fp, $len) {
+    if ($len <= 0) {
+        debug("len is less or equal to zero");
+        return '';
+    }
+    $buf = '';
+    $read = array($fp);
+    $write = $except = null;
+    while (stream_select($read, $write, $except, null)) {
+        $max = min(65536, $len - mb_orig_strlen($buf));
+        debug("about to read up to $max.");
+        $result = fread($fp, $max);
+        if ($result === false || !mb_orig_strlen($result)) return false;
+        $buf .= $result;
+        debug("buf_len: " . mb_orig_strlen($buf) . " len:$len");
+        if (mb_orig_strlen($buf) >= $len) {
+            debug("buf len is greater or equal to $len");
+            break;
+        }
+        $read = array($fp);
+    }
+    return $buf;
+}
+$filename = 'mosh-server-' . strtolower(php_uname("s")) . '-' . php_uname("m");
+echo "HASH $filename\n";
+$hash_len = freadAll(STDIN, 8);
+$hash = freadAll(STDIN, $hash_len);
+$hashes = explode(' ', $hash);
+$pathname_in = searchPath('mosh-server');
+$pathname = searchPath($filename);
+$md5 = $pathname ? md5_file($pathname) : '';
+$md5_in = $pathname_in ? md5_file($pathname_in) : '';
+if (!$md5 && in_array($md5_in, $hashes)) {
+    $pathname = $pathname_in;
+    $md5 = $md5_in;
+}
+if (empty($pathname) || !in_array($md5, $hashes)) {
+    echo "pathname:$pathname ($md5) hash:'$hash'\n";
+    $pathname = './' . $filename;
+    echo "GIVEMEBINARY\n";
+    $bytes = (int)freadAll(STDIN, 8);
+    echo "bytes: $bytes\n";
+    $file = freadAll(STDIN, $bytes);
+    echo "read: " . strlen($file) . "\n";
+    $wrote = file_put_contents($pathname, $file);
+    if ($wrote !== $bytes) die("Wrote " . var_export($wrote, true) . " instead of $bytes\n");
+    $res = chmod($pathname, 0755);
+    echo "chmod = " . var_export($res, true) . "\n";
+}
+$cmd = $pathname . " new -i 0.0.0.0";
+echo "running $cmd\n";
+directSystem($cmd);
+EOF;
+$code = $funcs . $code;
+$php_args = [
+    '-r',
+    preg_replace('/\\s+/s', ' ', $code),
+];
+if (isset($_SERVER['DEBUG'])) {
+    $php_args[] = '--';
+    $php_args[] = '--debug';
+}
+$php_cmd = 'php ' . implode(' ', array_map('escapeshellarg', $php_args));
+$ssh_args = [
+    '-e',
+    'none',
+    '-o',
+    'ProxyCommand=' . __FILE__ . ' @:fakeproxy %h %p',
+    $server,
+    $php_cmd,
+];
+$ssh_cmd = 'ssh ' . implode(' ', array_map('escapeshellarg', $ssh_args));
+$ph = proc_open($ssh_cmd, array(array('pipe', 'r'), array('pipe', 'w'), array('pipe', 'w')), $pipes);
+
+while (true) {
+    $read_fds = array($pipes[1], $pipes[2]);
+    $write_fds = mb_orig_strlen($wbuf) > 0 ? array($pipes[0]) : array();
+    $except_fds = null;
+    $selected = stream_select($read_fds, $write_fds, $except_fds, 20);
+    if ($selected === false) die("select failed\n");
+    if ($selected == 0) {
+        echo "nothing selected\n";
+        continue;
+    }
+    foreach ($read_fds as $stream) {
+        $ln = fgets($stream);
+        if ($ln === false || $ln === '') {
+            echo "remote closed\n";
+            break 2;
+        }
+        echo "remote: $ln";
+        $rbuf .= $ln;
+        if (mb_orig_substr($rbuf, -1) == "\n") {
+            if (trim($ln) == "GIVEMEBINARY") {
+                if (empty($filename)) die("could not give binary\n");
+                $contents = file_get_contents($filename);
+                $len = mb_orig_strlen($contents);
+                echo "filename $filename has $len bytes\n";
+                $wbuf .= sprintf("%8d", $len) . $contents;
+            } else if (preg_match('#PROXY ([^ \n]+)#', $ln, $m)) {
+                $addr = $m[1];
+            } else if (preg_match('#MOSH CONNECT (\d+) ([^ \n]+)#', $ln, $m)) {
+                $port = $m[1];
+                $key = $m[2];
+            } else if (preg_match('#HASH ([-_a-z0-9]+)#', $ln, $m)) {
+                $filename = searchPath($m[1]);
+                if (!$filename && empty($db[$m[1]])) {
+                    echo "err: $m[1] not found\n";
+                    exit(1);
+                } else if ($filename) $md5 = md5_file($filename);
+                else $md5 = implode(' ', $db[$m[1]]);
+                $wbuf .= sprintf("%8d", mb_orig_strlen($md5)) . $md5;
+                echo "found mosh-server at $filename ($md5)\n";
+            }
+        }
+    }
+    foreach ($write_fds as $stream) {
+        $wrote = fwrite($stream, $wbuf);
+        if ($wrote === false) {
+            echo "fwrite = false\n";
+            break 2;
+        }
+        debug("wrote: $wrote");
+        $wbuf = mb_orig_substr($wbuf, $wrote);
+    }
+}
+proc_close($ph);
+if ($key === null || $port === null) {
+    echo "key or port is null\n";
+    exit(1);
+}
+
+$client = searchPath('mosh-client');
+if (!$client) {
+    echo "mosh-client not fount\n";
+    exit(1);
+}
+
+$cmd = "MOSH_KEY=$key MOSH_PREDICTION_DISPLAY=$predict exec $client $addr $port";
+echo "running $cmd\n";
+directSystem($cmd);
+echo "cmd done\n";
